@@ -6,7 +6,12 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from stock_transformer import run_pipeline, predict_next_day, cfg
+try:
+    from stock_transformer import run_pipeline, predict_next_day, cfg
+except Exception as e:
+    import streamlit as st
+    st.error(f"Import error: {e}")
+    st.stop()
 
 st.set_page_config(page_title="Stock Predictor", page_icon="📈", layout="wide")
 
