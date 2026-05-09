@@ -1,10 +1,8 @@
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import MinMaxScaler
-import math
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.multioutput import MultiOutputRegressor
 
 # ─────────────────────────────────────────────
 # 1. CONFIGURATION
@@ -20,12 +18,12 @@ class Config:
     epochs        = 50
     lr            = 1e-4
     train_split   = 0.8
-    device        = "cuda" if torch.cuda.is_available() else "cpu"
+    device        = "cpu"
 
 cfg = Config()
 
 # ─────────────────────────────────────────────
-# 2. YOUR EXACT FEATURE COLUMNS
+# 2. FEATURE COLUMNS
 # ─────────────────────────────────────────────
 FEATURE_COLS = [
     "open", "high", "low", "close", "volume",
@@ -43,20 +41,8 @@ TARGET_COL = "close"
 
 
 # ─────────────────────────────────────────────
-# 3. DATASET
+# 3. BUILD SEQUENCES (flatten for sklearn)
 # ─────────────────────────────────────────────
-class StockDataset(Dataset):
-    def __init__(self, X, y):
-        self.X = torch.tensor(X, dtype=torch.float32)
-        self.y = torch.tensor(y, dtype=torch.float32)
-
-    def __len__(self):
-        return len(self.X)
-
-    def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
-
-
 def build_sequences(df, seq_len, scaler_X=None, scaler_y=None):
     df = df[FEATURE_COLS].copy()
     df.dropna(inplace=True)
@@ -78,112 +64,35 @@ def build_sequences(df, seq_len, scaler_X=None, scaler_y=None):
 
     X, y = [], []
     for i in range(seq_len, len(features)):
-        X.append(features[i - seq_len : i])
-        y.append(target[i])
+        X.append(features[i - seq_len : i].flatten())  # flatten for sklearn
+        y.append(target[i][0])
 
     return np.array(X), np.array(y), scaler_X, scaler_y
 
 
 # ─────────────────────────────────────────────
-# 4. POSITIONAL ENCODING
+# 4. SKLEARN MODEL (replaces Transformer)
 # ─────────────────────────────────────────────
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=5000, dropout=0.1):
-        super().__init__()
-        self.dropout = nn.Dropout(dropout)
-        pe  = torch.zeros(max_len, d_model)
-        pos = torch.arange(0, max_len).unsqueeze(1).float()
-        div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(pos * div)
-        pe[:, 1::2] = torch.cos(pos * div)
-        self.register_buffer("pe", pe.unsqueeze(0))
-
-    def forward(self, x):
-        x = x + self.pe[:, : x.size(1)]
-        return self.dropout(x)
-
-
-# ─────────────────────────────────────────────
-# 5. TRANSFORMER MODEL
-# ─────────────────────────────────────────────
-class StockTransformer(nn.Module):
-    def __init__(self, n_features, cfg):
-        super().__init__()
-        self.input_proj = nn.Linear(n_features, cfg.d_model)
-        self.pos_enc    = PositionalEncoding(cfg.d_model, dropout=cfg.dropout)
-        encoder_layer   = nn.TransformerEncoderLayer(
-            d_model=cfg.d_model, nhead=cfg.n_heads,
-            dim_feedforward=cfg.d_ff, dropout=cfg.dropout,
-            batch_first=True
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=cfg.n_layers)
-        self.head = nn.Sequential(
-            nn.Linear(cfg.d_model, 64),
-            nn.ReLU(),
-            nn.Dropout(cfg.dropout),
-            nn.Linear(64, 1)
+class StockTransformer:
+    """Wrapper around GradientBoostingRegressor to mimic torch model interface."""
+    def __init__(self):
+        self.model = GradientBoostingRegressor(
+            n_estimators=200,
+            learning_rate=0.05,
+            max_depth=4,
+            subsample=0.8,
+            random_state=42
         )
 
-    def forward(self, x):
-        x = self.input_proj(x)
-        x = self.pos_enc(x)
-        x = self.encoder(x)
-        return self.head(x[:, -1, :])
+    def fit(self, X, y):
+        self.model.fit(X, y)
+
+    def predict(self, X):
+        return self.model.predict(X)
 
 
 # ─────────────────────────────────────────────
-# 6. TRAINING
-# ─────────────────────────────────────────────
-def train_one_epoch(model, loader, optimizer, criterion, device):
-    model.train()
-    total_loss = 0
-    for X_b, y_b in loader:
-        X_b, y_b = X_b.to(device), y_b.to(device)
-        optimizer.zero_grad()
-        loss = criterion(model(X_b), y_b)
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        total_loss += loss.item() * len(X_b)
-    return total_loss / len(loader.dataset)
-
-
-@torch.no_grad()
-def evaluate(model, loader, criterion, device):
-    model.eval()
-    total_loss, preds, actuals = 0, [], []
-    for X_b, y_b in loader:
-        X_b, y_b = X_b.to(device), y_b.to(device)
-        pred = model(X_b)
-        total_loss += criterion(pred, y_b).item() * len(X_b)
-        preds.append(pred.cpu())
-        actuals.append(y_b.cpu())
-    return total_loss / len(loader.dataset), torch.cat(preds), torch.cat(actuals)
-
-
-def train(model, train_loader, val_loader, cfg):
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
-    criterion = nn.MSELoss()
-    best_val  = float("inf")
-
-    for epoch in range(1, cfg.epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, cfg.device)
-        val_loss, _, _ = evaluate(model, val_loader, criterion, cfg.device)
-        scheduler.step(val_loss)
-
-        if val_loss < best_val:
-            best_val = val_loss
-            torch.save(model.state_dict(), "04_models/best_model.pt")
-
-        if epoch % 10 == 0 or epoch == 1:
-            print(f"Epoch {epoch:3d}/{cfg.epochs}  Train MSE: {train_loss:.6f}  Val MSE: {val_loss:.6f}")
-
-    print(f"\n✅ Best Val MSE: {best_val:.6f}  →  Model saved to 04_models/best_model.pt")
-
-
-# ─────────────────────────────────────────────
-# 7. MAIN PIPELINE
+# 5. MAIN PIPELINE
 # ─────────────────────────────────────────────
 def run_pipeline(df):
     df = df.copy()
@@ -197,20 +106,14 @@ def run_pipeline(df):
 
     print(f"Train samples: {len(X_train)}  |  Val samples: {len(X_val)}")
 
-    train_loader = DataLoader(StockDataset(X_train, y_train), batch_size=cfg.batch_size, shuffle=True)
-    val_loader   = DataLoader(StockDataset(X_val,   y_val),   batch_size=cfg.batch_size)
+    model = StockTransformer()
+    model.fit(X_train, y_train)
 
-    n_features = X_train.shape[2]
-    model = StockTransformer(n_features, cfg).to(cfg.device)
-    print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}  |  Device: {cfg.device}\n")
+    preds_scaled = model.predict(X_val).reshape(-1, 1)
+    actuals_scaled = y_val.reshape(-1, 1)
 
-    train(model, train_loader, val_loader, cfg)
-
-    model.load_state_dict(torch.load("04_models/best_model.pt", map_location=cfg.device))
-    _, preds, actuals = evaluate(model, val_loader, nn.MSELoss(), cfg.device)
-
-    preds_inv   = scaler_y.inverse_transform(preds.numpy())
-    actuals_inv = scaler_y.inverse_transform(actuals.numpy())
+    preds_inv   = scaler_y.inverse_transform(preds_scaled)
+    actuals_inv = scaler_y.inverse_transform(actuals_scaled)
 
     mae  = np.mean(np.abs(preds_inv - actuals_inv))
     rmse = np.sqrt(np.mean((preds_inv - actuals_inv) ** 2))
@@ -225,15 +128,12 @@ def run_pipeline(df):
 
 
 # ─────────────────────────────────────────────
-# 8. PREDICT NEXT DAY
+# 6. PREDICT NEXT DAY
 # ─────────────────────────────────────────────
-@torch.no_grad()
 def predict_next_day(model, df_recent, scaler_X, scaler_y):
-    model.eval()
     df_recent = df_recent.copy()
     df_recent.dropna(inplace=True)
     features = scaler_X.transform(df_recent[FEATURE_COLS].values)
-    seq  = features[-cfg.seq_len:]
-    x    = torch.tensor(seq, dtype=torch.float32).unsqueeze(0).to(cfg.device)
-    pred = model(x).cpu().numpy()
-    return float(scaler_y.inverse_transform(pred)[0, 0])
+    seq = features[-cfg.seq_len:].flatten().reshape(1, -1)
+    pred_scaled = model.predict(seq).reshape(-1, 1)
+    return float(scaler_y.inverse_transform(pred_scaled)[0, 0])
